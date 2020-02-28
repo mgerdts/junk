@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: machine.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: machine.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * Copyright 2020 Joyent, Inc.
+ */
+
+/*
+ * A dummy version of node-vmadm using json files on the local file system
+ */
+
+var fs = require('fs');
+var net = require('net');
+var path = require('path');
+var stream = require('stream');
+var util = require('util');
+
+var assert = require('assert-plus');
+var vasync = require('vasync');
+var uuidv4 = require('uuid/v4');
+
+var diff = require('./diff');
+
+// These are the NIC properties that are boolean flags and we just remove when
+// false.
+var NIC_FLAGS = [
+    'allow_dhcp_spoofing',
+    'allow_ip_spoofing',
+    'allow_mac_spoofing',
+    'allow_restricted_traffic',
+    'allow_unfiltered_promisc',
+    'primary'
+];
+// NIC properties from vmadm's proptable.js
+var NIC_PROPERTIES = [
+    'allow_dhcp_spoofing',
+    'allow_ip_spoofing',
+    'allow_mac_spoofing',
+    'allow_restricted_traffic',
+    'allow_unfiltered_promisc',
+    'allowed_dhcp_cids',
+    'allowed_ips',
+    'blocked_outgoing_ports',
+    'dhcp_server',
+    'gateway',
+    'gateways',
+    'interface',
+    'ip',
+    'ips',
+    'mac',
+    'model',
+    'mtu',
+    'netmask',
+    'network_uuid',
+    'nic_tag',
+    'primary',
+    'vlan_id',
+    'vrrp_primary_ip',
+    'vrrp_vrid'
+];
+
+const MAX_CPU_COUNT = 100;
+const MAX_CPU_SHARES = 16000;   // XXX-mg verify; different on Linux and SmartOS
+const DEF_CPU_SHARES = 100;     // If not defined in package
+const DEF_TASKS = 2000;         // Following default for nspawn; zone.maxlwps
+const MAX_TASKS = 20000;
+const DEF_QUOTA = 10;           // GiB
+
+/**
+ * An ISO 8601 time like: 2020-04-01T12:34:56Z
+ * @typedef {string} ISOTime
+ */
+
+/**
+ * A UUID
+ * @typedef {string} UUID
+ */
+
+/**
+ * @typedef {Object} VMObject
+ * @property {string} alias - A friendly name for the machine.
+ * @property {boolean} autoboot - Does the machine start when the CN boots?
+ * @property {string} brand - Required. Must be 'lx' for this class.
+ * @property {int} cpu_cap - Percent of a CPU this machine may use.
+ * @property {int} cpu_shares - Relative amount of CPU time.  See @
+ * @property {ISOTime} create_timestamp - ISO 8601 time at creation. Default is
+ *           the time that the constructor is called.
+ * @property {Object} customer_metadata - Metadata keys not in the "sdc"
+ *           namespace. See https://eng.joyent.com/mdata/datadict.html.
+ * @property {string} dns_domain - The value of domain in /etc/hosts.
+ * @property {boolean} do_not_inventory - If true, do not report this machine to
+ *           the headnode.
+ * @property {boolean} firewall_enabled - Should cloud firewall be enabled?
+ * @property {string} hostname - The hostname to set in the machine.
+ * @property {string} image_uuid - The UUID of the machine image use to install
+ *           this machine.
+ * @property {boolean} indestructible_zoneroot - When set to true, the machine's
+ *           root file system is protected from deletion.
+ * @property {string} init_name - The name of the machine's init process.
+ * @property {Object} internal_metadata - Key:value pairs for metadata in any
+ *           namespace in internal_metadata_namepsaces.  These values are
+ *           read-only to the running machine.
+ * @property {string[]} internal_metadata_namespaces - The metadata namespaces
+ *           that will be read-only to the machine.
+ * @property {ISOTime} last_modified - Dynamic. The last time that the machine
+ *           configuration changed.
+ * @property {int} max_lwps - The maximum number of kernel threads or tasks the
+ *           machine may use.
+ * @property {Nic[]} nics - Network interfaces.
+ * @property {UUID} owner_uuid - The owner of the machine.
+ * @property {int} pid - Dynamic. The process ID of the init process.
+ * @property {string} platform_buildstamp - Dynamic. The platform image version,
+ *           typically as an ISO 8601 time stamp in the form that lacks hyphens
+ *           and colons (e.g. 20200401T123456Z).
+ * @property {int} quota - Disk space limit, in GiB.
+ * @property {int} ram - Physical memory limit, in MiB.
+ * @property {string[]} resolvers - IP addresses of up to 6 DNS name servers.
+ * @property {UUID} server_uuid - Dynamic. The UUID of the compute node.
+ * @property {string} state - The state of the machine. This value should only
+ *           be altered as a side effect of creating, booting, etc. the machine.
+ * @property {Object} tags - A key:value mapping of machine tags. See
+ *           https://docs.joyent.com/public-cloud/tags-metadata/tags.
+ * @property {UUID} uuid - The machine's unique identifier.
+ * @property {boolean} zfs_data_compression - The type of compression that
+ *           should be used on the machine's storage.  This only affects future
+ *           writes.
+ * @property {string} zfs_filesystem - Dynamic. The name of the ZFS file system
+ *           used by this machine.
+ * @property {string} zonepath - Dynamic. The mount point of zfs_filesystem.
+ * @property {string} zpool - The name of the ZFS pool containing this machine.
+ */
+
+/**
+ * Class representing a machine.
+ * @class
+ * @classdoc This class implements what is required for containers. Subclasses
+ * may implement triton-docker containers, KVM virtual machines, firecracker,
+ * etc.
+ */
+class Machine {
+    /**
+     * @param {Object} opts - Options
+     * @param {Object} opts.log - A logger, implementing debug, warn, and error.
+     * @param {boolean} opts.strict - If true, turn warnings into errors.
+     * @param {VMObject} obj - The "vmadm payload" traditionally used by Triton.
+     *        It must not contain any dynamic properties.
+     */
+    constructor(opts, obj) {
+        assert.object(opts, 'opts');
+        assert.object(opts.log, 'opts.log');
+        assert.optionalBool(opts.strict, 'opts.strict');
+        assert.object(obj);
+
+        var self = this;
+        this.init()
+        this.log = opts.log;
+
+        this.payload = {};
+
+        for (var name in obj) {
+            var value = obj[name];
+
+            var prop = this.props[name];
+            if (!prop) {
+                this.log.warn({'name': name, 'value': value},
+                    'Unsupported property');
+                if (opts.strict) {
+                    throw UnsupportedPropertyError(name, value)
+                }
+                continue;
+            }
+            prop.set(value);
+        }
+
+        this.validate();
+    }
+
+    validate() {
+        for (var name in this.props) {
+            var prop = this.props[name];
+
+            try {
+                if (prop.initialized || !prop.required) {
+                    continue;
+                }
+                assert.object(prop.target, 'prop.target for ' + name);
+                if (!prop.hasOwnProperty('defval')) {
+                    throw new MissingPropertyError(name);
+                }
+                prop.set(typeof(prop.defval) === 'function' ?
+                    prop.defval() : prop.defval);
+            } catch (err) {
+                self.log.error({prop: prop}, err);
+                throw err;
+            }
+        }
+    }
+
+    // Initialize sanity checkers and callbacks for each property
+    init() {
+        this.tritonConfig = {};
+        this.metadata = {
+            customer_metadata: {},
+            internal_metadata: {}
+        };
+        this.routes = {};
+        this.tags = {};
+
+        this.props = {
+            'alias': new MachPropString(this, 'alias', this.tritonConfig, {
+                    required: false
+                }),
+            'autoboot': new MachPropBool(this, 'autoboot', this.tritonConfig, {
+                    defval: false
+                }),
+            'brand': new MachPropString(this, 'brand', this.tritonConfig, {
+                    allowed: ['lx'],
+                    writable: false
+                }),
+            // Percent of a cpu: 200 == 2 cpus.
+            'cpu_cap': new MachPropInteger(this, 'cpu_cap', this.tritonConfig, {
+                    min: 1,
+                    max: 100 * MAX_CPU_COUNT,
+                    required: false,
+                    trigger: this.updateCPUCap
+                }),
+            'cpu_shares': new MachPropInteger(this, 'cpu_shares',
+                this.tritonConfig, {
+                    min: 1,
+                    max: MAX_CPU_SHARES,
+                    defval: DEF_CPU_SHARES,
+                    trigger: this.updateCPUShares
+                }),
+            'create_timestamp': new MachPropISO8601(this, 'create_timestamp',
+                    this.tritonConfig, {
+                    defval: this.nowISO8601,
+                    writable: false
+                }),
+            'customer_metadata': new MachPropDict(this, 'customer_metadata',
+                    this.metadata.customer_metadata, {
+                    required: false,
+                    trigger: this.updateCustomerMetadata
+                }),
+            'dns_domain': new MachPropString(this, 'dns_domain',
+                this.tritonConfig, {
+                    required: false
+                }),
+            'do_not_inventory': new MachPropBool(this, 'do_not_inventory',
+                this.tritonConfig, {
+                required: false
+            }),
+            'firewall_enabled': new MachPropBool(this, 'firewall_enabled',
+                this.tritonConfig, {
+                required: false,
+                validate: this.checkFirewallAllowed
+            }),
+            'hostname': new MachPropString(this, 'hostname',
+                this.tritonConfig, {
+                required: false,
+                max: 63
+            }),
+            'image_uuid': new MachPropUUID(this, 'image_uuid',
+                this.tritonConfig, {
+                    validate: this.checkImage,
+                    writable: false,
+                    required: false
+                }),
+            'indestructible_zoneroot': new MachPropBool(this,
+                'indestructible_zoneroot', this.tritonConfig, {
+                    required: false,
+                    implemented: false,
+                    trigger: this.updateIndestructibleZoneroot
+                }),
+            'init_name': new MachPropString(this, 'init_name',
+                this.tritonConfig, {
+                    required: false
+                }),
+            'internal_metadata': new MachPropDict(this, 'internal_metadata',
+                this.metadata.internal_metadata, {
+                required: false
+            }),
+            'last_modified': new MachPropDynamic(this, 'last_modified', null, {
+                getter: this.getLastModified
+            }),
+            'max_lwps': new MachPropInteger(this, 'max_lwps',
+                this.tritonConfig, {
+                min: 1,
+                max: MAX_TASKS,
+                defval: DEF_TASKS,
+                trigger: this.updateIndestructibleZoneroot
+            }),
+            'nics': new MachPropArrayOfDicts(this, 'nics', this.tritonConfig, {
+                validate: this.checkNICs,
+                trigger: this.updateNICs,
+                required: false
+            }),
+            'owner_uuid': new MachPropUUID(this, 'owner_uuid',
+                this.tritonConfig, {
+                defval: '00000000-0000-0000-0000-000000000000'
+            }),
+            'pid': new MachPropDynamic(this, 'pid', null, {
+                getter: this.getInitPid
+            }),
+            'platform_buildstamp': new MachPropDynamic(this,
+                'platform_buildstamp', null, {
+                getter: this.getPlatformBuildstamp
+            }),
+            // Disk quota in GiB
+            'quota': new MachPropInteger(this, 'quota', this.tritonConfig, {
+                min: 1,
+                defval: DEF_QUOTA,
+                getter: this.getQuota,
+                trigger: this.updateQuota
+            }),
+            // RAM, in MiB
+            'ram': new MachPropInteger(this, 'ram', this.tritonConfig, {
+                min: 1,
+                required: false
+            }),
+            'resolvers': new MachPropArrayOfStrings(this, 'resolvers',
+                this.tritonConfig, {
+                max: 6,
+                required: false
+            }),
+            'server_uuid': new MachPropDynamic(this, 'server_uuid', null, {
+                getter: this.getServerUUID
+            }),
+            'state': new MachPropString(this, 'state', this.tritonConfig, {
+                // Can set on-disk states only.
+                allowed: ['provisioning', 'configured', 'installed', 'deleting'],
+                defval: 'provisioning',
+                // The getter may return other states, like 'running'.
+                getter: this.getState
+            }),
+            'tags': new MachPropDict(this, 'tags', this.tags, {
+                validate: this.checkTags,
+                required: false
+            }),
+            'uuid': new MachPropUUID(this, 'uuid', this.tritonConfig, {
+                defval: this.getNewUUID,
+                writable: false
+            }),
+            // Currently on, off, lzjb, gzip, gzip1, ..., gzip9, zle, lz4.  This
+            // list may grow in future PIs, so leave it to the success or
+            // failure of updateCompression() to determine whether the supplied
+            // value was OK.
+            'zfs_data_compression': new MachPropString(this,
+                'zfs_data_compression', this.tritonConfig, {
+                required: false,
+                trigger: this.updateCompression
+            }),
+            'zfs_filesystem': new MachPropDynamic(this, 'zfs_filesystem',
+                null, {
+                getter: this.getZfsFilesystem
+            }),
+            'zonepath': new MachPropDynamic(this, 'zonepath', null, {
+                getter: this.getZonepath
+            }),
+            'zpool': new MachPropString(this, 'zpool', this.tritonConfig, {
+                defval: this.getSystemZpool,
+                validate: this.zpoolExists,
+                writable: false
+            })
+        }
+    }
+
+    get(propname) {
+        return this.props[propname].get();
+    }
+
+    checkImage(prop, value) {
+        // XXX-mg should ensure that the image matches the brand?  Maybe best to
+        // just let this fail during clone because it depends on the brand being
+        // set first.  Or maybe there is a brand-specific check in subclasses...
+    }
+
+    getLastModified(prop) {
+        // Look at various json files to determine when it was last modified.
+    }
+
+    getInitPid(prop) {
+    }
+
+    getPlatformBuildstamp(prop) {
+    }
+
+    getServerUUID(prop) {
+    }
+
+    getZfsFilesystem(prop) {
+        // XXX 'this' is a property, not the machine. WTF?
+        var self = prop.machine
+        return path.join(self.tritonConfig.zpool, self.tritonConfig.uuid);
+    }
+
+    getZonepath(prop) {
+        // XXX 'this' is a property, not the machine. WTF?
+        var self = prop.machine
+        return path.join('/', self.getZfsFilesystem(prop));
+    }
+
+    zpoolExists(prop) {
+        // XXX-mg
+        return true;
+    }
+
+    getSystemZpool() {
+        // XXX from sysinfo
+        return 'triton';
+    }
+
+    nowISO8601() {
+        var now = new Date();
+        return now.toISOString();
+    }
+}
+
+class MachProp {
+    constructor(machine, name, type, target, opts) {
+        assert.object(machine, 'machine');
+        assert.string(name, 'name');
+        assert.optionalString(type, 'type');
+        assert.optionalObject(target, 'target')
+        assert.object(opts, 'opts');
+        assert.optionalBool(opts.required, 'opts.implemented');
+        assert.optionalBool(opts.required, 'opts.required');
+        assert.optionalFunc(opts.getter, 'opts.getter');
+        assert.optionalFunc(opts.setter, 'opts.setter');
+        assert.optionalFunc(opts.validate, 'opts.validate');
+
+        var self = this;
+
+        this.machine = machine;
+        this.name = name;
+        this.type = type;
+        this.target = target;
+        this.implemented = !opts.implemented;
+        this.required = opts.hasOwnProperty('required') ? opts.required : true;
+        this.writable = opts.hasOwnProperty('writable') ? opts.writable : true;
+        this.initialized = false;
+        this.opts = opts;
+        this.value = undefined;
+        this.getter = opts.getter;
+        this.setter = opts.setter;
+
+        if (opts.hasOwnProperty('defval')) {
+            this.defval = opts.defval;
+        }
+
+        if (opts.getter) {
+            this.getter = opts.getter;
+        } else {
+            assert.object(target);
+            this.getter = function get() {
+                return self.target[self.name];
+            }
+        }
+
+        if (opts.setter) {
+            this.setter = opts.setter;
+        } else if (opts.writable) {
+            assert.object(target);
+            this.setter = function set(value) {
+                if (self.value !== undefined &amp;&amp; self.type !== null) {
+                    assert.strictEqual(typeof (value), self.type, 'self.type');
+                }
+                self.target[self.name] = value;
+            }
+        }
+    }
+
+    get() {
+        if (!this.implemented) {
+            throw new NotImplementedError(this);
+        }
+        if (this.getter) {
+            return this.getter(this);
+        }
+        return this.target[this.name];
+    }
+
+    set(value) {
+        if (!this.implemented) {
+            throw new NotImplementedError(this);
+        }
+        if (!this.writable &amp;&amp; this.initialized) {
+            throw new ReadOnlyPropertyError(this.name);
+        }
+        this.validate(value);
+
+        if (this.setter) {
+            this.setter(this, value);
+        } else {
+            this.target[this.name] = value;
+        }
+        this.initialized = true;
+    }
+
+    validate(value) {
+        if (this.value === undefined) {
+            assert.bool(!this.required, 'required value must not be undefined');
+        } else {
+            assert.strictEqual(typeof (value), this.type, 'this.type');
+        }
+        if (this.opts.validate) {
+            this.opts.validate(this, value);
+        }
+    }
+}
+
+class ReadOnlyPropertyError extends Error {
+    constructor(propname) {
+        super(util.format('property %s is read-only', propname));
+        this.propname = propname;
+    }
+}
+
+class MissingPropertyError extends Error {
+    constructor(propname) {
+        super(util.format('required property %s is missing', propname));
+        this.propname = propname;
+    }
+}
+
+class UnsupportedPropertyError extends Error {
+    constructor(propname) {
+        super(util.format('required property %s is not supported', propname));
+        this.propname = propname;
+    }
+}
+
+class MachPropArrayOfDicts extends MachProp {
+    constructor(machine, name, target, opts) {
+        super(machine, name, 'object', target, opts);
+    }
+}
+class MachPropArrayOfStrings extends MachProp {
+    constructor(machine, name, target, opts) {
+        super(machine, name, 'object', target, opts);
+    }
+}
+class MachPropBool extends MachProp {
+    constructor(machine, name, target, opts) {
+        super(machine, name, 'boolean', target, opts);
+    }
+}
+class MachPropDict extends MachProp {
+    constructor(machine, name, target, opts) {
+        super(machine, name, 'object', target, opts);
+    }
+}
+
+/** 
+ * A machine property determined soledy by runtime state
+ */
+class MachPropDynamic extends MachProp {
+    /**
+     * Create a dynamic property.
+     * @param {Machine} machine - The machine to which this property belongs.
+     * @param {string} name - The name of the property.
+     * @param {Object} opts - Options, as described in the MachProp constructor.
+     * @param {function} opts.getter - Required. Generates a value when called.
+     * @param {boolean} opts.required - Not allowed in this class.
+     * @param {boolean} opts.writable - Not allowed in this class.
+     */
+    constructor(machine, name, opts) {
+        assert.strictEqual(opts.required, undefined, 'opts.required');
+        assert.strictEqual(opts.writable, undefined, 'opts.writable');
+        assert.func(opts.getter, 'opts.getter');
+        opts.required = false;
+        opts.writable = false;
+        super(machine, name, null, null, opts);
+    }
+}
+
+class MachPropInteger extends MachProp {
+    constructor(machine, name, target, opts) {
+        assert.optionalNumber(opts.min, 'opts.min');
+        assert.optionalNumber(opts.max, 'opts.max');
+        super(machine, name, null, target, opts);
+    }
+
+    validate(value) {
+        super.validate();
+
+        assert.strictEqual(value, parseInt(value),
+            this.name + ' must be an integer');
+
+        if (this.opts.hasOwnProperty('min')) {
+            assert.bool(value >= this.opts.min,
+                this.name + ' must be >= ' + this.opts.min);
+        }
+        if (this.opts.hasOwnProperty('max')) {
+            assert.bool(value &lt;= this.opts.max,
+                this.name + ' must be &lt;= ' + this.opts.max);
+        }
+        if (this.opts.hasOwnProperty('allowed')) {
+            assert.notStrictEqual(this.opts.allowed.indexOf(value), -1,
+                'invalid value: ' + value);
+        }
+    }
+}
+
+class MachPropISO8601 extends MachProp {
+    constructor(machine, name, target, opts) {
+        super(machine, name, 'string', target, opts);
+    }
+
+    validate(value) {
+        super();
+
+        var check = new Date(Date.parse(value));
+        assert.strictEqual(value, check.toISOString(),
+            this.name + ' must be ISO date string');
+    }
+}
+
+class MachPropUUID extends MachProp {
+    constructor(machine, name, target, opts) {
+        super(machine, name, 'string', target, opts);
+    }
+
+    validate(value) {
+        assert.uuid(value);
+        super();
+    }
+}
+
+class MachPropString extends MachProp {
+    constructor(machine, name, target, opts) {
+        super(machine, name, 'string', target, opts);
+    }
+
+    validate(value) {
+        super.validate();
+
+        if (this.opts.hasOwnProperty('min')) {
+            assert.bool(value.length >= this.opts.min, 'min length');
+        }
+        if (this.opts.hasOwnProperty('max')) {
+            assert.bool(value.length &lt;= this.opts.max, 'max length');
+        }
+        if (this.opts.hasOwnProperty('allowed')) {
+            assert.notStrictEqual(this.opts.allowed.indexOf(value), -1,
+                'invalid value: ' + value);
+        }
+    }
+}
+
+module.exports.Machine = Machine;
+
+log = {
+    warn: console.log,
+    error: console.log
+};
+try {
+    m = new Machine({log: log}, {
+        'brand': 'lx',
+        'uuid': '59dbff72-57fb-11ea-ab55-c34b504ec844'
+    });
+    console.log(m.tritonConfig)
+    console.log('zpool:', m.get('zpool'));
+    console.log('zfs_filesystem:', m.get('zfs_filesystem'));
+    console.log('zonepath:', m.get('zonepath'));
+} catch (err) {
+    console.log(err);
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="Machine.html">Machine</a></li><li><a href="MachPropDynamic.html">MachPropDynamic</a></li></ul><h3><a href="global.html">Global</a></h3>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.3</a> on Fri Feb 28 2020 19:23:20 GMT+0000 (UTC)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
